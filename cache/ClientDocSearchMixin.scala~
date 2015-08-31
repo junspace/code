@@ -1,0 +1,922 @@
+// Copyright 2012 i-MD. All rights reserved.
+
+package com.imd.home.routes.client
+
+import org.scalatra._
+
+import com.google.gson.JsonElement
+import com.google.gson.JsonParser
+import com.imd.home.ImdSupport
+import com.imd.home.controllers.DocSearchController
+import com.imd.home.controllers.UtilController
+import com.imd.webframework.ForbiddenException
+import com.imd.webframework.UnauthorizedException
+import com.imd.docsearch.fulltext.{FetchStatus, FetchDocStatus, FullTextFetchInfo}
+import com.imd.docsearch.fulltext.{UserDocLimit, ADTYPE, ClientType, FullTextDownloadInfo}
+import com.imd.docsearch.fulltext.{DownloadFullTextPdfStream}
+import com.imd.user.controllers.UserController
+import com.imd.home.controllers.docsearch.UserDocsController
+import com.imd.user.data.scalawrapper.{UserInfo => SUserInfo}
+import com.imd.user.controllers.{UserController => ImdUserController}
+
+import com.imd.docsearch.fulltext.download.DownloadStatus
+import com.imd.home.data.docsearch.SimpleQuery
+import com.imd.home.helpers.Helper
+import com.imd.home.routes.docsearch.BaseDocsFulltextMixin
+import java.io.OutputStream
+import java.util.ArrayList
+
+import com.imd.util.thrift.ThriftSerializer;
+
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
+
+/**
+ * Handler doc search.
+ *
+ * @author huajie.wu@i-md.com (Wu Huajie)
+ */
+trait ClientDocSearchMixin extends BaseDocsFulltextMixin {
+  self: ScalatraServlet =>
+
+  private val logger = LoggerFactory.getLogger(this.getClass)
+
+  get("/client/docsearch/s/?") {
+    val sq = new SimpleQuery()
+    sq.query = params("q");
+    sq.source = params("src");
+    sq.pageNo = "1";
+    sq.pageSize = "20";
+    sq.sort = "5";
+    try {
+      sq.pageNo = params("pn");
+      sq.pageSize = params("ps");
+      sq.sort = params("sort");
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: java.util.NoSuchElementException =>
+    }
+    sq.SCI = "0";  //0 means false.
+    sq.reviews = "0";
+    sq.coreJournal = "0";
+    sq.category = "0,0,0,0";
+    try {
+      sq.SCI = params("sci");
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: java.util.NoSuchElementException =>
+    }
+    try {
+      sq.reviews = params("reviews");
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: java.util.NoSuchElementException =>
+    }
+    try {
+      sq.coreJournal = params("cj");
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: java.util.NoSuchElementException =>
+    }
+    try {
+      sq.category = params("cg");
+    } catch {
+      case _: java.util.NoSuchElementException =>
+    }
+    val userid = helper.clientUidOrNullString;
+    if (request != null && request.getContentType() != null &&
+        request.getContentType().contains(MIME_JSON)) {
+      contentType = MIME_JSON;
+      ThriftSerializer.toJson(DocSearchController.searchJson(userid, sq))
+//      new String(new JsonThriftSerializer().toBytes(
+//          DocSearchController.searchJson(userid, sq, cookies)), "utf-8")
+    } else {
+      throw new ForbiddenException("you hit error. please use json content type")
+    }
+  }
+
+  post("/client/docsearch/advsearch/?") {
+    contentType = MIME_JSON;
+    val userid = helper.clientUidOrNullString;
+    ThriftSerializer.toJson(DocSearchController.advSearch(userid, request.body, cookies, "MOBILE"));
+  }
+
+  post("/client/docsearch/checkstatus/?") {
+    contentType = MIME_JSON;
+    val docs = multiParams("ids").toList
+    val userid = helper.clientUidOrNullString
+    ThriftSerializer.toJson(DocSearchController.checkUserDocsStatus(userid, docs))
+  }
+
+  get("/client/docsearch/doc/:id/?") {
+    val id = params("id");
+    if (request != null && request.getContentType() != null &&
+        request.getContentType().contains(MIME_JSON)) {
+      contentType = MIME_JSON;
+      ThriftSerializer.toJson(DocSearchController.getArticleJson(id))
+    } else {
+      throw new ForbiddenException("you hit error. please use json content type")
+    }
+  }
+
+  /**
+   * Document detail for mobile.
+   */
+  get("/mobile/docsearch/doc/:id/:openid/:src/:mobile") {
+    val id = params("id")
+    val src = params("src")
+    val mobile = params("mobile")
+    val userId = try {
+      ImdUserController.getUidByMobile(mobile)
+    } catch {
+      case _ => ""
+    }
+    val openid = params("openid")
+    val userAgent = request.getHeader("User-Agent")
+    val isWeixin = userAgent.indexOf("MicroMessenger") > -1
+    val indexUrl = helper.indexUrl
+    val accountsUrl = helper.accountsDomain
+    if (true) {
+      render("/mobile/article.ssp",
+        DocSearchController.getArticleMobile(id, userId, indexUrl, src, mobile, accountsUrl, openid))
+    } else {
+      "200"
+    }
+  }
+
+  get("/mobile/docsearch/doc/download/?") {
+    val id = params("id")
+    val userId = params("userId")
+    val user = UserController.getUserInfo(userId)
+    val fulltext = DocSearchController.downloadFullText(user, id, "192.168.1.1")
+    replyDownloadFulltextForMobile(fulltext, id)
+  }
+
+  get("/mobile/docsearch/doc/checkdownload/?") {
+    val id = params("id")
+    val userId = params("userId")
+    val user = UserController.getUserInfo(userId)
+    val fulltext = DocSearchController.downloadFullText(user, id, "192.168.1.1")
+    checkDownloadFulltextForMobile(fulltext, id)
+  }
+
+  get("/client/docsearch/docu/:id/?") {
+    val id = params("id");
+    if (request != null && request.getContentType() != null &&
+        request.getContentType().contains(MIME_JSON)) {
+      contentType = MIME_JSON;
+      val (userid, isEmailActived, isMobileActived) = helper.user match {
+        case Some(userInfo) =>
+          val userid = helper.useridFromUserinfo(userInfo)
+          val isEmailActived = helper.isEmailActived(userInfo)
+          val isMobileActived = helper.isMobileActived(userInfo)
+          (userid, isEmailActived, isMobileActived)
+        case None => ("", false, false)
+      }
+      val article = DocSearchController.getArticleWithOp(id, userid)
+      if (article.isLogin) {
+        article.setEmailActive(isEmailActived)
+        article.setMobileActive(isMobileActived)
+      }
+      ThriftSerializer.toJson(article);
+    } else {
+      throw new ForbiddenException("you hit error. please use json content type")
+    }
+  }
+
+  post("/client/docsearch/docs/?") {
+    if (request != null && request.getContentType() != null &&
+        request.getContentType().contains(MIME_JSON)) {
+      contentType = MIME_JSON;
+      ThriftSerializer.toJson(DocSearchController.getArticlesJson(request.body));
+    } else {
+      throw new ForbiddenException("you hit error. please use json content type")
+    }
+  }
+
+
+
+  /**
+   * For mobile only now.
+   * TODO(wuhuajie): more security?.
+   */
+  get("/client/docsearch/download/:id/?") {
+    var t = 0
+    try {
+      helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      val id = params("id");
+      val userInfo = helper.userOrError
+      val userid = helper.useridFromUserinfo(userInfo)
+      val isEmailActived = helper.isEmailActived(userInfo)
+      val isMobileActived = helper.isMobileActived(userInfo)
+
+      val downloadinfo = new FullTextDownloadInfo
+      downloadinfo.setExternalId(id)
+      downloadinfo.setUserId(userid)
+      if (request.getHeader("User-Agent").toLowerCase.contains("imd-ios-iphone")) {
+        downloadinfo.setClientType(ClientType.IOS_IPHONE)
+      } else if (request.getHeader("User-Agent").toLowerCase.contains("imd-ios-ipad")) {
+        downloadinfo.setClientType(ClientType.IOS_IPAD)
+      } else if (request.getHeader("User-Agent").toLowerCase.contains("imd-android-phone")) {
+        downloadinfo.setClientType(ClientType.ANDROID_PHONE)
+      } else if (request.getHeader("User-Agent").toLowerCase.contains("imd-android-pad")) {
+        downloadinfo.setClientType(ClientType.ANDROID_PAD)
+      } else if (request.getHeader("User-Agent").toLowerCase.contains("imd-ios")) {
+        downloadinfo.setClientType(ClientType.IOS_IPAD)
+      } else {
+        downloadinfo.setClientType(ClientType.IOS_IPAD)
+      }
+
+      val limit = new UserDocLimit()
+      limit.setEmailActive(isEmailActived);
+      limit.setMobileActive(isMobileActived);
+      limit.setUnqiueId(helper.clientUidOrError)
+
+      if (downloadinfo.getUserId().equalsIgnoreCase("test4imd@gmail.com") ||
+          downloadinfo.getUserId().equalsIgnoreCase("lero.8fox@gmail.com")) {
+        limit.setDownloadLevel(200);
+        limit.setFetchLevel(200)
+      }
+
+      downloadinfo.setUserDocLimit(limit)
+      val fulltext = DocSearchController.downloadFullTextDo(downloadinfo, "MOBILE");
+      // TODO(Bryan Zhang): for compatible with old app bug.
+      // if (fulltext != null && fulltext.status == DownloadStatus.MOBILEINACTIVE) {
+      //   fulltext.setStatus(DownloadStatus.UNVERIFIED)
+      // }
+      if (fulltext != null && fulltext.status == DownloadStatus.SUCCESS) {
+        response.setContentType("application/pdf")
+        val title = fulltext.getTitle()
+        if (title != null) {
+          if (helper.isIe) {
+            response.setHeader("Content-Disposition",
+              "attachment;filename=\"" + java.net.URLEncoder.encode(title, "UTF-8") + ".pdf\"")
+          } else if (helper.isSafari) {
+            val encodeTitle = new String(title.getBytes("UTF-8"), "ISO-8859-1")
+            response.setHeader("Content-Disposition",
+              "attachment;filename=\"" + encodeTitle + ".pdf\"")
+          } else {
+            response.setHeader("Content-Disposition",
+              "attachment;filename*=\"utf-8''" +
+              java.net.URLEncoder.encode(title, "UTF-8") + ".pdf\"")
+          }
+        } else {
+          response.setHeader("Content-Disposition",
+            "attachment;filename=\"" + id + ".pdf\"")
+        }
+        response.setContentLength(fulltext.getPdfStream().length)
+        fulltext.getPdfStream();
+      } else {
+        if (request != null && request.getContentType() != null &&
+            request.getContentType().contains(MIME_JSON)) {
+          contentType = MIME_JSON;
+          if (fulltext != null) {
+            logger.debug("====" + fulltext.status);
+            fulltext.status.toString
+          } else {
+            DownloadStatus.FAIL.toString
+          }
+        } else if (fulltext != null && fulltext.status == DownloadStatus.QUEUE) {
+          render("/client/docsearch/fulltext_error.ssp",
+            Map("errorMessage" -> helper.i18n("imd.web.docsearch.download.waiting")))
+        } else {
+          render("/client/docsearch/fulltext_error.ssp",
+            Map("errorMessage" -> helper.i18n("imd.web.docsearch.download.not_serving")))
+        }
+      }
+    } else {
+      "NOTAUTH"
+    }
+  }
+  /**
+   *  New Download API with detailed message set on server side.
+  */
+  get("/client/docsearch/dl/:id/?") {
+    val id = params("id");
+    val ret = new FullTextRetInfo
+    if (!helper.isLogin) {
+      ret.setStatus("NOTAUTH")
+      ret.setMessage("")
+      ret
+    } else {
+      val userid = helper.clientUidOrError;
+      val fulltext = DocSearchController.downloadFullTextDo(
+         Utils.genDownloadInfo(helper, userid, id, request.getHeader("User-Agent")), "MOBILE")
+
+      // TODO(Bryan Zhang): for compatible with old app bug.
+      if (fulltext != null && fulltext.status == DownloadStatus.MOBILEINACTIVE) {
+        fulltext.setStatus(DownloadStatus.UNVERIFIED)
+      }
+      if (fulltext != null && fulltext.status == DownloadStatus.SUCCESS) {
+        response.setContentType("application/pdf")
+        val title = fulltext.getTitle()
+        if (title != null) {
+          if (helper.isIe) {
+            response.setHeader("Content-Disposition",
+              "attachment;filename=\"" + java.net.URLEncoder.encode(title, "UTF-8") + ".pdf\"")
+          } else if (helper.isSafari) {
+            val encodeTitle = new String(title.getBytes("UTF-8"), "ISO-8859-1")
+            response.setHeader("Content-Disposition",
+              "attachment;filename=\"" + encodeTitle + ".pdf\"")
+          } else {
+            response.setHeader("Content-Disposition",
+              "attachment;filename*=\"utf-8''" +
+              java.net.URLEncoder.encode(title, "UTF-8") + ".pdf\"")
+          }
+        } else {
+          response.setHeader("Content-Disposition",
+            "attachment;filename=\"" + id + ".pdf\"")
+        }
+        response.setContentLength(fulltext.getPdfStream().length)
+        fulltext.getPdfStream();
+      } else {
+        if (request != null && request.getContentType() != null &&
+            request.getContentType().contains(MIME_JSON)) {
+          contentType = MIME_JSON;
+          Utils.checkDownloadStatus(helper, fulltext, ret)
+        }
+        logger.debug(ret.toString)
+        ThriftSerializer.toJson(ret)
+      }
+    }
+  }
+
+  get("/client/docsearch/askfor2/?") {
+    val id = params("id");
+    val title = params("title");
+    var username = "";
+    var email = "";
+    val mobile = "";
+    contentType = MIME_JSON;
+    var t = 0
+    try {
+      username = params("username");
+      email = params("email");
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: java.util.NoSuchElementException =>
+    }
+    val ret = new FullTextRetInfo
+    if (!helper.isLogin) {
+      ret.setStatus("NOTAUTH")
+      ret.setMessage("")
+    } else {
+      val userid = helper.clientUidOrError;
+
+      //TODO(Wuhuajie): Mainly for refine interface in future.
+      var fulltext = DocSearchController.askForFulltext(Utils.genFetchInfo(helper, userid,
+        id, request.getHeader("User-Agent"), title, email, username, mobile), "MOBILE")
+      // TODO(Bryan Zhang): for compatile with old app bug, should fix it.
+      if (fulltext != null && fulltext.status == FetchStatus.MOBILEINACTIVE) {
+        fulltext.setStatus(FetchStatus.UNVERIFIED)
+      }
+      Utils.checkFetchStatus(helper, fulltext, ret)
+    }
+    ThriftSerializer.toJson(ret)
+  }
+
+  post("/client/docsearch/askforstatus/?") {
+    var t = 0;
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      val user = UserController.getUserInfo(userid)
+      val emailOrMobileOrNullString = user.email.getOrElse(user.mobile.getOrElse(""))
+      ThriftSerializer.toJson(DocSearchController.askForStatus(emailOrMobileOrNullString, request.body));
+    } else {
+      t
+    }
+  }
+
+  get("/client/docsearch/askforpdf/:externalId/?") {
+    val externalId = params("externalId")
+    val internalId = "-1"
+    var t = 0;
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      var userAgent = request.getHeader("User-Agent");
+      logger.debug("userAgent" + userAgent);
+      val fulltext = DocSearchController.getFetchDoc(userid, externalId, userAgent);
+      if (fulltext != null && fulltext.status.equalsIgnoreCase(FetchDocStatus.SUCCESS.toString())) {
+        response.setContentType("application/pdf")
+        val title = externalId
+        if (title != null) {
+          if (helper.isIe) {
+            response.setHeader("Content-Disposition",
+              "attachment;filename=\"" + java.net.URLEncoder.encode(title, "UTF-8") + ".pdf\"")
+          } else if (helper.isSafari) {
+            val encodeTitle = new String(title.getBytes("UTF-8"), "ISO-8859-1")
+            response.setHeader("Content-Disposition",
+              "attachment;filename=\"" + encodeTitle + ".pdf\"")
+          } else {
+            response.setHeader("Content-Disposition",
+              "attachment;filename*=\"utf-8''" +
+              java.net.URLEncoder.encode(title, "UTF-8") + ".pdf\"")
+          }
+        } else {
+          response.setHeader("Content-Disposition",
+            "attachment;filename=\"" + title + ".pdf\"")
+        }
+        response.setContentLength(fulltext.getPdfStream().length)
+        if (fulltext.getStatus().equalsIgnoreCase("SUCCESS")) {
+          fulltext.getPdfStream()
+        } else {
+          fulltext.getStatus()
+        }
+      } else {
+        "FAIL"
+      }
+    } else {
+      "NOTAUTH"
+    }
+  }
+
+  /**
+   * status: (true/false) for (done/in-progress).
+   * start: start point of the return.
+   * limit: number of request to return.
+   */
+  get("/client/docsearch/askforlist/?") {
+    val status =  params.getOrElse("status", "true").toBoolean;
+    val start = params("start").toInt;
+    val limit = params("limit").toInt;
+    contentType = MIME_JSON;
+    if (helper.isLogin) {
+      val (email, mobile) = helper.emailAndMobileOrEmptyString;
+      ThriftSerializer.toJson(
+        DocSearchController.getAskforList(email, mobile, status, start, limit));
+    } else {
+      "NOTAUTH"
+    }
+  }
+
+  /**
+   * Get compatible(download/request) askfor list for client.
+   * start: start point of the return.
+   * limit: number of request to return.
+   * @author youmin.zhang@i-md.com
+   */
+  get("/client/docsearch/askforcompatiblelist/?") {
+    val cat = params("cat").toInt; // 0:all, 1:cn, 2:en.
+    val start = params("start").toInt;
+    val limit = params("limit").toInt;
+    contentType = MIME_JSON;
+    if (helper.isLogin) {
+      val (email, mobile) = helper.emailAndMobileOrEmptyString;
+      ThriftSerializer.toJson(
+        UserDocsController.getAskforCompatibleList(email, mobile, cat, start, limit))
+    } else {
+      "NOTAUTH"
+    }
+  }
+
+  /**
+   * Get favorate  list for client.
+   * start: start point of the return.
+   * limit: number of request to return.
+   * @author youmin.zhang@i-md.com
+   */
+  get("/client/docsearch/askforfavlist/?") {
+    val cat = params("cat").toInt; // 0:all, 1:cn, 2:en.
+    val start = params("start").toInt;
+    val limit = params("limit").toInt;
+    contentType = MIME_JSON;
+    if (helper.isLogin) {
+      val userid = helper.clientUidOrError;
+      ThriftSerializer.toJson(UserDocsController.getFavs(userid, start, limit, cat))
+    } else {
+      "NOTAUTH"
+    }
+  }
+
+  /**
+   * Get document askfor list for mobile.
+   * status: (true/false) for (done/in-progress).
+   * start: start point of the return.
+   * limit: number of request to return.
+   * @author yi.zhou@i-md.com
+   */
+  get("/mobile/docsearch/askforlist/?") {
+    val status = params.getOrElse("status", "true").toBoolean;
+    val start = params("start").toInt;
+    val limit = params("limit").toInt;
+    val mobile = params("mobile")
+    val email = UserController.getEmailByMobile(mobile)
+    contentType = MIME_JSON;
+    ThriftSerializer.toJson(
+      DocSearchController.getAskforList(email, mobile, status, start, limit))
+  }
+
+  /**
+   * start: start point of the return.
+   * limit: number of downloads to return.
+   */
+  get("/client/docsearch/downloadlist/?") {
+    val start = params("start").toInt;
+    val limit = params("limit").toInt;
+
+    contentType = MIME_JSON;
+    if (helper.isLogin) {
+      val userid = helper.clientUidOrError;
+      ThriftSerializer.toJson(DocSearchController.getDownloadList(userid, start, limit));
+    } else {
+      "NOTAUTH"
+    }
+  }
+
+  /**
+   * Get download list for mobile.
+   * start: start point of the return.
+   * limit: number of downloads to return.
+   * @author yi.zhou@i-md.com
+   */
+  get("/mobile/docsearch/downloadlist/?") {
+    val start = params("start").toInt;
+    val limit = params("limit").toInt;
+    val mobile = params("mobile")
+    val email = UserController.getEmailByMobile(mobile)
+    contentType = MIME_JSON;
+    ThriftSerializer.toJson(DocSearchController.getDownloadList(email, start, limit, mobile));
+  }
+
+
+  get("/client/docsearch/askfor/?") {
+    val id = params("id");
+    val title = params("title");
+    val devices = params.getOrElse("devices", "")
+    val app = params.getOrElse("app", "imd")
+    var username = "";
+    var email = "";
+    val mobile = "";
+    contentType = MIME_JSON;
+    var t = 0
+    try {
+      username = params("username");
+      email = params("email");
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: java.util.NoSuchElementException =>
+    }
+    try {
+      helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      val info = new FullTextFetchInfo()
+      val userInfo = helper.userOrError
+      val userid = helper.useridFromUserinfo(userInfo)
+      val isEmailActived = helper.isEmailActived(userInfo)
+      val isMobileActived = helper.isMobileActived(userInfo)
+      info.userId = userid
+      info.chName = userInfo.realname.getOrElse("")
+      info.mobile = userInfo.mobile.getOrElse("")
+      info.devices = devices
+      info.app = app
+
+      // save userip , clientType, docsearch client in idc.
+      info.userIP = helper.getIp
+      info.idc = "" // (TODO) zhaoyou should be define a flag sj2 or ch2.
+      val ua = request.getHeader("User-Agent")
+      if (ua.contains("imd-ios-iphone")) {
+        info.setClientType(ClientType.IOS_IPHONE)
+      } else if (ua.contains("imd-ios-ipad")) {
+        info.setClientType(ClientType.IOS_IPAD)
+      } else if (ua.contains("imd-android-phone")) {
+        info.setClientType(ClientType.ANDROID_PHONE)
+      } else if (ua.contains("imd-android-pad")) {
+        info.setClientType(ClientType.ANDROID_PAD)
+      } else if (ua.contains("imd-ios")) {
+        info.setClientType(ClientType.IOS_IPAD)
+      } else {
+        info.setClientType(ClientType.IOS_IPAD)
+      }
+      info.version = if (ua.contains("8") || ua.contains("9")) "current" else "legacy"
+      val limit = new UserDocLimit();
+      limit.setEmailActive(isEmailActived)
+      limit.setMobileActive(isMobileActived)
+      limit.setUnqiueId(helper.uidOrError)
+
+      if (info.userId.equalsIgnoreCase("test4imd@gmail.com") ||
+          info.userId.equalsIgnoreCase("lero.8fox@gmail.com")) {
+        limit.setDownloadLevel(200);
+        limit.setFetchLevel(200)
+      }
+      info.setUserDocLimit(limit);
+      info.externalId = id;
+      if (title != null && title.length() > 0) {
+        info.title = title;
+      }
+      if (email != null && email.length() > 0) {
+        //For meeting ipad doc search.
+        info.email = email;
+      }
+      if (username != null && username.length() > 0) {
+        //For meeting ipad doc search.
+        info.chName = username;
+      }
+      if (mobile != null && mobile.length() > 0) {
+        info.mobile = mobile;
+      }
+      logger.debug(info.toString())
+      //TODO(Wuhuajie): Mainly for refine interface in future.
+      var ret = DocSearchController.askForFulltext(info, "MOBILE");
+      // TODO(Bryan Zhang): for compatible with old app bug, should fix in future.
+      if (ret != null && ret.status == FetchStatus.MOBILEINACTIVE) {
+        ret.setStatus(FetchStatus.UNVERIFIED)
+      }
+      logger.debug("askfor ret = {}", ret)
+      ret.status.toString
+
+    } else {
+      "NOTAUTH"
+    }
+  }
+
+  /**
+   * askfor doc for weixin.
+   */
+  get("/mobile/docsearch/askfor/:id/:userId/?") {
+    val id = params("id");
+    // val title = params("title");
+    val userId = params("userId");
+    contentType = MIME_JSON;
+    var t = 0
+    val userInfo = UserController.getUserInfo(userId)
+    if (t == 0) {
+      val info = new FullTextFetchInfo()
+      info.userId = userInfo.mobile.getOrElse("")
+      info.chName = userInfo.realname.getOrElse("")
+      info.mobile = userInfo.mobile.getOrElse("")
+      info.devices = "WEIXIN"
+
+      // save userip , clientType, docsearch client in idc.
+      info.userIP = "192.168.1.110"
+      info.idc = "" // (TODO) zhaoyou should be define a flag sj2 or ch2.
+      if (request.getHeader("User-Agent").toLowerCase.contains("imd-ios-iphone")) {
+        info.clientType = ClientType.IOS_IPHONE
+      } else if (request.getHeader("User-Agent").toLowerCase.contains("imd-ios-ipad")) {
+        info.clientType = ClientType.IOS_IPAD
+      } else if (request.getHeader("User-Agent").toLowerCase.contains("imd-android-phone")) {
+        info.clientType = ClientType.ANDROID_PHONE
+      } else if (request.getHeader("User-Agent").toLowerCase.contains("imd-android-pad")) {
+        info.clientType = ClientType.ANDROID_PAD
+      } else if (request.getHeader("User-Agent").toLowerCase.contains("imd-ios")) {
+        info.setClientType(ClientType.IOS_IPAD)
+      } else {
+        info.setClientType(ClientType.IOS_IPAD)
+      }
+
+      val limit = new UserDocLimit();
+      limit.setEmailActive(userInfo.userVerifyInfo.head.emailVerified.getOrElse(false))
+      limit.setMobileActive(userInfo.userVerifyInfo.head.mobileVerified.getOrElse(false))
+      limit.setUnqiueId(userId)
+
+      if (info.userId.equalsIgnoreCase("test4imd@gmail.com") ||
+          info.userId.equalsIgnoreCase("lero.8fox@gmail.com") ||
+          info.userId.equalsIgnoreCase("15900456656")) {
+        limit.setDownloadLevel(200);
+        limit.setFetchLevel(200)
+      }
+      info.setUserDocLimit(limit);
+      info.externalId = id;
+      // if (title != null && title.length() > 0) {
+      //   info.title = title;
+      // }
+      // if (email != null && email.length() > 0) {
+      //   //For meeting ipad doc search.
+      //   info.email = email;
+      // }
+      // if (username != null && username.length() > 0) {
+      //   //For meeting ipad doc search.
+      //   info.chName = username;
+      // }
+      // if (mobile != null && mobile.length() > 0) {
+      //   info.mobile = mobile;
+      // }
+      logger.debug(info.toString())
+      //TODO(Wuhuajie): Mainly for refine interface in future.
+      var ret = DocSearchController.askForFulltext(info, "WEIXIN");
+      logger.debug("askfor ret = {}", ret)
+      ret.status.toString
+    } else {
+      "NOTAUTH"
+    }
+  }
+
+  get("/client/docsearch/suggest/?") {
+    val q = params("q");
+    val src = params("src");
+    val max_matches = params("max_matches");
+    val use_similar = params("use_similar");
+    contentType = MIME_JSON;
+    DocSearchController.suggest(q, src, max_matches, use_similar);
+  }
+
+  get("/client/docsearch/fav/?") {
+    val id = params("id");
+    val title = params("title");
+    var t = 0
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      DocSearchController.addFav(userid, id);
+    } else {
+      t
+    }
+  }
+
+  get("/client/docsearch/removefav/:id/?") {
+    val id = params("id");
+    var t = 0
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      DocSearchController.removeFav(userid, id);
+    } else {
+      t
+    }
+  }
+
+  get("/client/docsearch/isfav/:id/?") {
+    val id = params("id");
+    var t = 0
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      DocSearchController.isFav(userid, id);
+    } else {
+      t
+    }
+  }
+
+  get("/client/docsearch/favs/?") {
+    var t = 0
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: Exception =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      ThriftSerializer.toJson(DocSearchController.getFavs(userid));
+      //new String(new JsonThriftSerializer().toBytes(DocSearchController.getFavs(userid)));
+    } else {
+      t
+    }
+  }
+
+  get("/client/docsearch/shares/?") {
+    var t = 0
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      DocSearchController.getShares(userid);
+    } else {
+      t
+    }
+  }
+
+  post("/client/docsearch/sendshare/?") {
+    var t = 0
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      val jsonElement = new JsonParser().parse(request.body);
+      val id = jsonElement.getAsJsonObject().get("id").getAsString()
+      val mails = jsonElement.getAsJsonObject().get("mails").getAsString()
+      val title = jsonElement.getAsJsonObject().get("title").getAsString()
+      val reason = jsonElement.getAsJsonObject().get("reason").getAsString()
+
+      DocSearchController.sendShare(userid, id, mails, title, reason)
+    } else {
+      t
+    }
+  }
+
+  post("/client/docsearch/save/?") {
+    var t = 0
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      val jsonElement = new JsonParser().parse(request.body);
+      val query = jsonElement.getAsJsonObject().get("query").getAsString()
+      val source = jsonElement.getAsJsonObject().get("source").getAsString()
+      val searchtype = jsonElement.getAsJsonObject().get("type").getAsString()
+
+      DocSearchController.saveQuery(userid, query, source, searchtype, "MOBILE");
+    } else {
+      t
+    }
+  }
+
+  get("/client/docsearch/saves/?") {
+    var t = 0
+    var userid = ""
+    try {
+      userid = helper.clientUidOrError;
+    } catch {
+      //It is better to set all of value. But make them optional now.
+      case _: UnauthorizedException =>
+        response.setStatus(401)
+        t = -401
+    }
+    if (t == 0) {
+      //DocSearchController.getQueries(userid);
+      ThriftSerializer.toJson(DocSearchController.getQueries(userid));
+    } else {
+      t
+    }
+  }
+
+  import com.imd.app.cache.Cache
+  import com.imd.util.time.Time
+  import com.imd.util.time.Conversions._
+
+  get("/client/latest/?") {
+    val offset = params.getOrElse("offset", "0").toInt
+    val limit = params.getOrElse("limit", "10").toInt
+    Cache.getOrElse(
+      "latest_" + offset + "_" + limit + "_" + Time.now.inMinutes,
+      1.minutes.inSeconds,
+      ThriftSerializer.toJson(DocSearchController.getLatest(offset, limit)))
+  }
+
+  get("/client/ad/?") {
+    Cache.getOrElse(
+      "ad_" + Time.now.inHours,
+      1.hours.inSeconds,
+      ThriftSerializer.toJson(DocSearchController.getAD))
+  }
+
+}
